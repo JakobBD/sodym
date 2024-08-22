@@ -84,6 +84,7 @@ class StockWithDSM(Stock):
         assert self.ldf_type is not None, "lifetime not yet set"
         assert self.inflow is not None, "inflow not yet set"
         self.dsm = DynamicStockModel(
+            t = self.stock.dims.dimensions[0], #TODO
             shape=self.stock.dims.shape(),
             inflow=self.inflow.values,
             ldf_type=self.ldf_type,
@@ -98,6 +99,7 @@ class StockWithDSM(Stock):
         assert self.ldf_type is not None, "lifetime not yet set"
         assert self.stock is not None, "stock arry not yet set"
         self.dsm = DynamicStockModel(
+            t = self.stock.dims.dimensions[0], #TODO
             shape=self.stock.dims.shape(),
             stock=self.stock.values,
             ldf_type=self.ldf_type,

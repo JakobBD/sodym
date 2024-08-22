@@ -16,6 +16,7 @@ import scipy.stats
 class DynamicStockModel(object):
     def __init__(
         self,
+        t,
         shape,
         inflow=None,
         outflow=None,
@@ -29,6 +30,7 @@ class DynamicStockModel(object):
         outflow_by_cohort=None,
         sf=None,
     ):
+        self.t = t
         self.shape = tuple(shape)
         self.n_t = list(shape)[0]
         self.shape_cohort = (self.n_t,) + self.shape
@@ -129,7 +131,7 @@ class DynamicStockModel(object):
         self.pdf = np.zeros(self.shape_cohort)
         self.pdf[self.t_diag_indices] = 1.0 - np.moveaxis(self.sf.diagonal(0, 0, 1), -1, 0)
         for m in range(0, self.n_t):
-            self.pdf[np.arange(m + 1, self.n_t), m, ...] = -1 * np.diff(self.sf[np.arange(m, self.n_t), m, ...], axis=0)
+            self.pdf[m+1:, m, ...] = -1 * np.diff(self.sf[m:, m, ...], axis=0)
         return self.pdf
 
     def compute_lt__2__sf(self):  # survival functions
@@ -152,84 +154,76 @@ class DynamicStockModel(object):
         self.sf = np.zeros(self.shape_cohort)
         # Perform specific computations and checks for each lifetime distribution:
 
-        def remaining_ages(m):
-            return self.tile(np.arange(0, self.n_t - m))
+        # fixed lifetime, age-cohort leaves the stock in the model year when the age specified as 'Mean' is reached.
+        for m in range(0, self.n_t):  # cohort index
+            sf = self.get_sf_by_year_id(m)
+            self.sf[m::, m, ...] = sf
 
-        if (
-            self.ldf_type == "Fixed"
-        ):  # fixed lifetime, age-cohort leaves the stock in the model year when the age specified as 'Mean' is reached.
-            for m in range(0, self.n_t):  # cohort index
-                self.sf[m::, m, ...] = (remaining_ages(m) < self.lifetime_mean[m, ...]).astype(
-                    int
-                )  # converts bool to 0/1
-            # Example: if lt is 3.5 years fixed, product will still be there after 0, 1, 2, and 3 years, gone after 4
-            # years.
+    def get_sf_by_year_id(self, m):
+        remaining_ages = self.tile(self.t[m:] - self.t[m])
 
-        if (
-            self.ldf_type == "Normal"
-        ):  # normally distributed lifetime with mean and standard deviation. Watch out for nonzero values
-            # for negative ages, no correction or truncation done here. Cf. note below.
-            for m in range(0, self.n_t):  # cohort index
-                self.sf[m::, m, ...] = scipy.stats.norm.sf(
-                    remaining_ages(m),
-                    loc=self.lifetime_mean[m, ...],
-                    scale=self.lifetime_std[m, ...],
-                )
-                # NOTE: As normal distributions have nonzero pdf for negative ages, which are physically impossible,
-                # these outflow contributions can either be ignored (violates the mass balance) or allocated to the
-                # zeroth year of residence, the latter being implemented in the method compute compute_o_c_from_s_c.
-                # As alternative, use lognormal or folded normal distribution options.
+        if self.ldf_type == "Fixed":
+            return self.sf_fixed(remaining_ages, self.lifetime_mean[m, ...])
+        elif self.ldf_type == "Normal":
+            return self.lt_normal(remaining_ages, self.lifetime_mean[m, ...], self.lifetime_std[m, ...])
+        elif self.ldf_type == "FoldedNormal":
+            return self.lt_folded_normal(remaining_ages, self.lifetime_mean[m, ...], self.lifetime_std[m, ...])
+        elif self.ldf_type == "LogNormal":
+            return self.lt_lognormal(remaining_ages, self.lifetime_mean[m, ...], self.lifetime_std[m, ...])
+        elif self.ldf_type == "Weibull":
+            return self.lt_weibull(remaining_ages, self.lifetime_shape[m, ...], self.lifetime_scale[m, ...])
 
-        if (
-            self.ldf_type == "FoldedNormal"
-        ):  # Folded normal distribution, cf. https://en.wikipedia.org/wiki/Folded_normal_distribution
-            for m in range(0, self.n_t):  # cohort index
-                self.sf[m::, m, ...] = scipy.stats.foldnorm.sf(
-                    remaining_ages(m),
-                    self.lifetime_mean[m, ...] / self.lifetime_std[m, ...],
-                    0,
-                    scale=self.lifetime_std[m, ...],
-                )
-                # NOTE: call this option with the parameters of the normal distribution mu and sigma of curve BEFORE
-                # folding, curve after folding will have different mu and sigma.
+    def sf_fixed(self, remaining_ages, lifetime_mean):
+        # Example: if lt is 3.5 years fixed, product will still be there after 0, 1, 2, and 3 years, gone after 4
+        # years.
+        return (remaining_ages < self.lifetime_mean).astype(int)
 
-        if self.ldf_type == "LogNormal":  # lognormal distribution
-            # Here, the mean and stddev of the lognormal curve,
-            # not those of the underlying normal distribution, need to be specified! conversion of parameters done here:
-            for m in range(0, self.n_t):  # cohort index
-                # calculate parameter mu    of underlying normal distribution:
-                lt_ln = np.log(
-                    self.lifetime_mean[m, ...]
-                    / np.sqrt(
-                        1
-                        + self.lifetime_mean[m, ...]
-                        * self.lifetime_mean[m, ...]
-                        / (self.lifetime_std[m, ...] * self.lifetime_std[m, ...])
-                    )
-                )
-                # calculate parameter sigma of underlying normal distribution:
-                sg_ln = np.sqrt(
-                    np.log(
-                        1
-                        + self.lifetime_mean[m, ...]
-                        * self.lifetime_mean[m, ...]
-                        / (self.lifetime_std[m, ...] * self.lifetime_std[m, ...])
-                    )
-                )
-                # compute survial function
-                self.sf[m::, m, ...] = scipy.stats.lognorm.sf(remaining_ages(m), s=sg_ln, loc=0, scale=np.exp(lt_ln))
-                # values chosen according to description on
-                # https://docs.scipy.org/doc/scipy-0.13.0/reference/generated/scipy.stats.lognorm.html
-                # Same result as EXCEL function "=LOGNORM.VERT(x;LT_LN;SG_LN;TRUE)"
+    def lt_normal(self, remaining_ages, lifetime_mean, lifetime_std):
+        # for negative ages, no correction or truncation done here. Cf. note below.
+        # NOTE: As normal distributions have nonzero pdf for negative ages, which are physically impossible,
+        # these outflow contributions can either be ignored (violates the mass balance) or allocated to the
+        # zeroth year of residence, the latter being implemented in the method compute compute_o_c_from_s_c.
+        # As alternative, use lognormal or folded normal distribution options.
+        return scipy.stats.norm.sf(
+                remaining_ages,
+                loc=lifetime_mean,
+                scale=lifetime_std,
+            )
 
-        if self.ldf_type == "Weibull":  # Weibull distribution with standard definition of scale and shape parameters
-            for m in range(0, self.n_t):  # cohort index
-                self.sf[m::, m, ...] = scipy.stats.weibull_min.sf(
-                    remaining_ages(m),
-                    c=self.lifetime_shape[m, ...],
-                    loc=0,
-                    scale=self.lifetime_scale[m, ...],
-                )
+    def lt_folded_normal(self, remaining_ages, lifetime_mean, lifetime_std):
+        # Folded normal distribution, cf. https://en.wikipedia.org/wiki/Folded_normal_distribution
+        # NOTE: call this option with the parameters of the normal distribution mu and sigma of curve BEFORE
+        # folding, curve after folding will have different mu and sigma.
+        return scipy.stats.foldnorm.sf(
+                remaining_ages,
+                lifetime_mean / lifetime_std,
+                0,
+                scale=lifetime_std,
+            )
+
+    def lt_lognormal(self, remaining_ages, lifetime_mean, lifetime_std):
+        # lognormal distribution
+        # values chosen according to description on
+        # https://docs.scipy.org/doc/scipy-0.13.0/reference/generated/scipy.stats.lognorm.html
+        # Same result as EXCEL function "=LOGNORM.VERT(x;LT_LN;SG_LN;TRUE)"
+
+        # Here, the mean and stddev of the lognormal curve,
+        # not those of the underlying normal distribution, need to be specified! conversion of parameters done here:
+        # calculate parameter mu of underlying normal distribution:
+        exp_lt_ln = (lifetime_mean / np.sqrt( 1 + lifetime_mean ** 2 / lifetime_std **2))
+        # calculate parameter sigma of underlying normal distribution:
+        sg_ln = np.sqrt( np.log( 1 + lifetime_mean ** 2 / lifetime_std **2))
+        # compute survial function
+        return scipy.stats.lognorm.sf(remaining_ages, s=sg_ln, loc=0, scale=exp_lt_ln)
+
+    def lt_weibull(self, remaining_ages, lifetime_shape, lifetime_scale):
+        # Weibull distribution with standard definition of scale and shape parameters
+        return scipy.stats.weibull_min.sf(
+                remaining_ages,
+                c=lifetime_shape,
+                loc=0,
+                scale=lifetime_scale,
+            )
 
     """
     Part 3: Inflow driven model
